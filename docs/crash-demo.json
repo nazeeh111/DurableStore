@@ -1,0 +1,53 @@
+{
+  "process_crash_only": true,
+  "cases": [
+    {
+      "boundary": "append_header",
+      "acknowledged_value_survived": true,
+      "acknowledged_delete_survived": true,
+      "restart_writable": true
+    },
+    {
+      "boundary": "append_payload",
+      "acknowledged_value_survived": true,
+      "acknowledged_delete_survived": true,
+      "restart_writable": true
+    },
+    {
+      "boundary": "append_sync",
+      "acknowledged_value_survived": true,
+      "acknowledged_delete_survived": true,
+      "restart_writable": true
+    },
+    {
+      "boundary": "compact_header",
+      "acknowledged_value_survived": true,
+      "acknowledged_delete_survived": true,
+      "restart_writable": true
+    },
+    {
+      "boundary": "compact_record",
+      "acknowledged_value_survived": true,
+      "acknowledged_delete_survived": true,
+      "restart_writable": true
+    },
+    {
+      "boundary": "compact_sync",
+      "acknowledged_value_survived": true,
+      "acknowledged_delete_survived": true,
+      "restart_writable": true
+    },
+    {
+      "boundary": "compact_rename",
+      "acknowledged_value_survived": true,
+      "acknowledged_delete_survived": true,
+      "restart_writable": true
+    },
+    {
+      "boundary": "compact_dirsync",
+      "acknowledged_value_survived": true,
+      "acknowledged_delete_survived": true,
+      "restart_writable": true
+    }
+  ]
+}

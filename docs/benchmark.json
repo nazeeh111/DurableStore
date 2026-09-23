@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "package_version": "0.1.0",
+  "profile": "release",
+  "os": "macos",
+  "arch": "aarch64",
+  "kernel": "Darwin 25.6.0",
+  "cpu": "unavailable",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "available_parallelism": 10,
+  "keys": 1000,
+  "value_bytes": 256,
+  "put_operations": 2000,
+  "read_operations": 10000,
+  "delete_operations": 250,
+  "write_seconds": 9.210640334,
+  "durable_put_ns": {
+    "p50": 4121292,
+    "p95": 6932875,
+    "p99": 8120792
+  },
+  "in_memory_get_ns": {
+    "p50": 84,
+    "p95": 125,
+    "p99": 458
+  },
+  "compact_ns": 15003125,
+  "reopen_ns": 8071875,
+  "log_bytes_before": 602016,
+  "log_bytes_after": 222016,
+  "validated": true
+}
