@@ -6,8 +6,8 @@ Local verification: September 23, 2026, macOS aarch64, Rust 1.98.1. These result
 | --- | --- |
 | `cargo fmt --check` | Passed |
 | `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
-| `cargo test --locked` | 19 unit/integration entries and 1 README compilation test passed |
-| `cargo test --locked --all-features` | 22 unit/integration entries and 1 README compilation test passed |
+| `cargo test --locked` | 20 unit/integration entries and 1 README compilation test passed |
+| `cargo test --locked --all-features` | 23 unit/integration entries and 1 README compilation test passed |
 | `cargo build --release --locked` | Passed |
 | `python3 scripts/crash_demo.py target/debug/durablestore` after feature build | All 8 public demonstration cases passed |
 | Release benchmark: 1,000 keys, 256-byte values | 2,000 durable puts, 10,000 memory gets, 250 deletes, compaction and full reopened-state validation passed |
@@ -41,3 +41,7 @@ No isolated-disk baseline, throughput comparison, sustained-load study, or power
 ## Remaining limits
 
 Only local filesystem process-crash semantics were exercised. Disk-full errors, controller/cache behavior under power loss, filesystem fault injection, network filesystems and production deployment were not validated. Record CRCs are not authenticated. External destructive edits cannot be recovered. Startup and live data use memory proportional to the current dataset. The directory and lock pathname must remain in place while a store is open, and other programs must respect the lock.
+
+## Cross-platform follow-up
+
+The first hosted Linux run exposed a transient lock retained while another test spawned a child process. A deterministic duplicated-descriptor regression failed locally before the fix. The lock guard now explicitly unlocks on drop, including failed-open paths, instead of relying only on descriptor closure. The regression confirms exclusivity while the owner is live and immediate reacquisition after owner drop even while a duplicate descriptor remains open.

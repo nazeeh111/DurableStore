@@ -50,6 +50,8 @@ fn save_result(directory: &std::path::Path) -> durablestore::Result<()> {
 
 `inspect` acquires the lock and scans without creating files or repairing a tail. Ordinary opens can repair a tail. All commands require exclusive access; this intentionally avoids a second concurrent-reader consistency contract. Never delete or replace `LOCK`, or rename/delete the store directory, while any handle is open.
 
+Spawning a child that immediately executes a new program is supported. Do not fork and then use or drop an inherited `Store` in the child: its lock refers to the same operating-system object as the parent, and unlocking either copy releases that shared lock. Open a fresh store only after executing the child program.
+
 A checksum detects accidental damage, not hostile changes. An incomplete suffix caused by a failed append is indistinguishable from some kinds of external truncation; recovery cannot reconstruct bytes that a separate program destroyed. The process-crash tests do **not** demonstrate power-loss safety on every controller or filesystem. Durability depends on the filesystem and hardware honoring synchronization. macOS `sync_all` is not a claim of hardware-cache flush via `F_FULLFSYNC`.
 
 ## Inside the engine

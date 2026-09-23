@@ -68,7 +68,7 @@ pub struct Stats {
 /// Owns the exclusive lock. Dropping closes the handle and releases the lock.
 pub struct Store {
     dir: PathBuf,
-    _lock: File,
+    _lock: LockGuard,
     log: File,
     entries: BTreeMap<Vec<u8>, Vec<u8>>,
     records: u64,
@@ -77,7 +77,17 @@ pub struct Store {
     poisoned: bool,
 }
 
-fn lock(dir: &Path, create: bool) -> Result<File> {
+struct LockGuard(File);
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        // A concurrent process spawn can briefly duplicate this open-file
+        // description. Closing only our descriptor would leave its lock held
+        // until that child execs. Release ownership explicitly before closing.
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock(dir: &Path, create: bool) -> Result<LockGuard> {
     if !dir.is_dir() {
         return Err(Error::InvalidInput("store directory must already exist"));
     }
@@ -88,7 +98,7 @@ fn lock(dir: &Path, create: bool) -> Result<File> {
         .truncate(false)
         .open(dir.join("LOCK"))?;
     match f.try_lock() {
-        Ok(()) => Ok(f),
+        Ok(()) => Ok(LockGuard(f)),
         Err(std::fs::TryLockError::WouldBlock) => Err(Error::Locked),
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
@@ -261,3 +271,28 @@ pub fn inspect(dir: impl AsRef<Path>) -> Result<Stats> {
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 pub struct ReadmeExamples;
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn owner_drop_releases_lock_even_with_duplicate_descriptor() {
+        let dir =
+            std::env::temp_dir().join(format!("durablestore-lock-drop-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let store = Store::open(&dir).unwrap();
+        // Models the shared open-file description held briefly by fork before exec.
+        let duplicate = store._lock.0.try_clone().unwrap();
+        assert!(matches!(Store::open(&dir), Err(Error::Locked)));
+        drop(store);
+        let reopened = Store::open(&dir);
+        drop(duplicate);
+        assert!(
+            reopened.is_ok(),
+            "owner drop must explicitly release its lock"
+        );
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
