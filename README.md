@@ -1,10 +1,10 @@
 # DurableStore
 
-**A small storage engine with a durability contract you can inspect.**
+**A Rust key-value store with synchronized writes and crash recovery.**
 
-DurableStore is an original Rust byte-key store: synchronized writes, checksummed records, bounded recovery, an exclusive writer lock, and atomic compaction. Its purpose is to make storage tradeoffs measurable, from the moment a write is acknowledged to what remains after an interrupted process. It includes a usable library, JSON command-line tools, a crash demonstration, and a repeatable benchmark.
+DurableStore stores byte keys and values in a checksummed log with bounded recovery, an exclusive writer lock and atomic compaction. It includes a Rust library, a JSON command-line interface, a crash-recovery demonstration and a repeatable benchmark.
 
-**Development history:** Built locally using Git before publication. Publication dates describe when this repository became available, not a backdated development timeline.
+**Development history:** Developed locally with Git before publication.
 
 ## Try it
 
@@ -36,7 +36,7 @@ fn save_result(directory: &std::path::Path) -> durablestore::Result<()> {
 }
 ```
 
-## Persistence, precisely
+## Persistence contract
 
 | Event | Behavior |
 | --- | --- |
@@ -76,7 +76,7 @@ flowchart LR
 
 See [the binary format](docs/format.md) and [design decisions](docs/design.md). The entire implementation uses safe Rust and the standard library.
 
-## Crash it, then recover
+## Crash-recovery checks
 
 ```sh
 cargo test --locked
@@ -87,9 +87,9 @@ python3 scripts/crash_demo.py target/debug/durablestore
 
 The optional feature makes specifically named boundaries terminate with exit code 86, bypassing Rust destructors. The demonstration checks acknowledged values and deletions after each termination, then confirms the reopened store accepts another write. The default binary ignores those environment variables. **Do not enable `fault-injection` for real data.**
 
-Tests also compare seeded operation sequences against an independent `BTreeMap` model, flip every individual byte of a fixture, cut its final record at every offset, interrupt initialization and tail recovery, reject oversized inputs, exercise lock contention across processes, and inject I/O errors that must poison a handle. These are bounded adversarial checks, not a proof of universal correctness.
+Tests also compare seeded operation sequences against an independent `BTreeMap` model, flip every individual byte of a fixture, cut its final record at every offset, interrupt initialization and tail recovery, reject oversized inputs, exercise lock contention across processes, and inject I/O errors that must poison a handle. These tests cover the listed failure cases.
 
-## Measure it
+## Benchmark
 
 ```sh
 cargo run --release --locked --example benchmark -- ./bench-store 1000 > benchmark.json
@@ -103,4 +103,4 @@ The destination must not already exist. The benchmark writes each 256-byte value
 
 Maximum key: **1 MiB**. Maximum value: **16 MiB**. Empty keys and values work. Startup is linear in log bytes and holds all live data in RAM; compaction needs temporary disk space for the full live set. There is no multi-key transaction, SQL, replication, encryption, TTL, concurrent reader process, background compaction, or network-filesystem support. Data directories must be trusted: this is not a hardened service that accepts arbitrary paths from hostile clients. Compaction removes historical versions, so preserve an offline copy if you need a forensic history.
 
-This is a research and engineering portfolio project with explicit recovery tests, not a production database certification. MIT licensed; copyright nazeeh111.
+MIT licensed; copyright nazeeh111.
