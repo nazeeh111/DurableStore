@@ -1,5 +1,22 @@
 # Verification record
 
+## Atomic batches, September 27, 2026
+
+Local macOS arm64, Rust 1.98.1:
+
+- Formatting and strict Clippy passed. Default tests passed 29 unit/integration entries plus two README compilation tests; fault-injection tests passed 35 entries plus two README tests. Counts include subprocess helper entry points.
+- Batch checks cover ordered put/delete operations, duplicate and empty keys, empty library batches, count/size rejection before append, poisoned-handle behavior, every byte cut of a small final batch, and complete malformed members with recomputed outer checksums. Invalid records were rejected without modifying the log.
+- Three batch subprocess termination boundaries and three returned-I/O-error boundaries verified all-or-none recovered state. Returned errors retained the old in-memory state and required reopening.
+- CLI file and standard-input flows passed, including CRLF, empty byte fields, malformed later lines, invalid UTF-8 and excessive member counts. Invalid input preserved even an existing incomplete tail, demonstrating validation before opening the store.
+- The release binary ran `scripts/batch_demo.py`: the job status, pending index and result changed together, survived a new process opening the store, and survived compaction. This uses synthetic local data and sends no messages.
+- The previous source revision `ee85e4366480fec1e5dbe3e1bd05c5e23cf479a7` was separately built. The new binary read its log; the old binary rejected a new batch without changing bytes. After new-binary compaction, the old binary could read the resulting ordinary records.
+- Independent review also ran an 80-step seeded model of mixed CLI batches and single writes, including binary/duplicate keys, process reopens and compaction. Each observed state matched the independent model; separate malformed-member and old-reader probes passed. No actionable finding remained.
+- The existing eight-case process-crash demonstration passed again. No new performance or physical power-loss claim is made.
+
+Hosted Linux/macOS and minimum-Rust results are recorded with the release after CI completes. A complete unacknowledged batch may survive; the guarantee is absence of partial batch state within the supported filesystem contract.
+
+## Earlier single-operation baseline
+
 Local verification: September 23, 2026, macOS aarch64, Rust 1.98.1. These results are bounded observations on one machine. Linux and Rust 1.89 checks are configured in CI but were not executed locally for this record.
 
 | Check | Observed result |

@@ -1,10 +1,12 @@
-use crate::{Error, Result};
+use crate::{Error, Operation, Result};
 use std::io::{Read, Seek, SeekFrom};
 
 pub const FILE_HEADER: usize = 16;
 pub const RECORD_HEADER: usize = 32;
 pub const MAX_KEY: usize = 1024 * 1024;
 pub const MAX_VALUE: usize = 16 * 1024 * 1024;
+pub const MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_BATCH_OPERATIONS: usize = 1024;
 
 // IEEE CRC-32, reflected polynomial; bitwise implementation keeps dependencies at zero.
 pub fn crc32(bytes: &[u8]) -> u32 {
@@ -54,6 +56,96 @@ pub fn encode(seq: u64, key: &[u8], value: Option<&[u8]>) -> Result<Vec<u8>> {
     Ok(record)
 }
 
+pub fn encode_batch(seq: u64, operations: &[Operation<'_>]) -> Result<Vec<u8>> {
+    if operations.is_empty() || operations.len() > MAX_BATCH_OPERATIONS {
+        return Err(Error::InvalidInput("batch must contain 1..1024 operations"));
+    }
+    let mut payload_len = 4usize; // Operation count.
+    for operation in operations {
+        let (key, value) = match operation {
+            Operation::Put(key, value) => (*key, *value),
+            Operation::Delete(key) => (*key, &[][..]),
+        };
+        validate(key, value)?;
+        payload_len = payload_len
+            .checked_add(9)
+            .and_then(|n| n.checked_add(key.len()))
+            .and_then(|n| n.checked_add(value.len()))
+            .ok_or(Error::InvalidInput("batch exceeds 32 MiB"))?;
+        if payload_len > MAX_BATCH_BYTES {
+            return Err(Error::InvalidInput("batch exceeds 32 MiB"));
+        }
+    }
+    let mut record = Vec::with_capacity(RECORD_HEADER + payload_len);
+    record.resize(RECORD_HEADER, 0);
+    record[..4].copy_from_slice(b"DSR1");
+    record[4] = 2;
+    record[8..16].copy_from_slice(&seq.to_le_bytes());
+    record[20..24].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    record.extend_from_slice(&(operations.len() as u32).to_le_bytes());
+    for operation in operations {
+        let (tag, key, value) = match operation {
+            Operation::Put(key, value) => (0, *key, *value),
+            Operation::Delete(key) => (1, *key, &[][..]),
+        };
+        record.push(tag);
+        record.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        record.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        record.extend_from_slice(key);
+        record.extend_from_slice(value);
+    }
+    let payload_crc = crc32(&record[RECORD_HEADER..]);
+    record[24..28].copy_from_slice(&payload_crc.to_le_bytes());
+    let header_crc = crc32(&record[..28]);
+    record[28..32].copy_from_slice(&header_crc.to_le_bytes());
+    Ok(record)
+}
+
+fn decode_batch(payload: &[u8]) -> std::result::Result<Vec<Operation<'_>>, &'static str> {
+    let invalid = "invalid batch payload";
+    if payload.len() < 4 {
+        return Err(invalid);
+    }
+    let count = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+    if count == 0 || count > MAX_BATCH_OPERATIONS {
+        return Err(invalid);
+    }
+    let mut operations = Vec::with_capacity(count);
+    let mut at = 4;
+    for _ in 0..count {
+        if payload.len() - at < 9 {
+            return Err(invalid);
+        }
+        let tag = payload[at];
+        let key_len = u32::from_le_bytes(payload[at + 1..at + 5].try_into().unwrap()) as usize;
+        let value_len = u32::from_le_bytes(payload[at + 5..at + 9].try_into().unwrap()) as usize;
+        at += 9;
+        if tag > 1
+            || key_len > MAX_KEY
+            || value_len > MAX_VALUE
+            || (tag == 1 && value_len != 0)
+            || key_len
+                .checked_add(value_len)
+                .is_none_or(|n| n > payload.len() - at)
+        {
+            return Err(invalid);
+        }
+        let key = &payload[at..at + key_len];
+        at += key_len;
+        let value = &payload[at..at + value_len];
+        at += value_len;
+        operations.push(if tag == 0 {
+            Operation::Put(key, value)
+        } else {
+            Operation::Delete(key)
+        });
+    }
+    if at != payload.len() {
+        return Err(invalid);
+    }
+    Ok(operations)
+}
+
 pub struct Scan {
     pub entries: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
     pub records: u64,
@@ -92,7 +184,7 @@ pub fn scan<R: Read + Seek>(reader: &mut R) -> Result<Scan> {
         let mut h = [0; RECORD_HEADER];
         reader.read_exact(&mut h)?;
         let corrupt = |reason| Error::Corruption { offset: at, reason };
-        if &h[..4] != b"DSR1" || h[5..8] != [0, 0, 0] || h[4] > 1 {
+        if &h[..4] != b"DSR1" || h[5..8] != [0, 0, 0] || h[4] > 2 {
             return Err(corrupt("invalid record header"));
         }
         let u32_at = |i| u32::from_le_bytes(h[i..i + 4].try_into().unwrap());
@@ -105,7 +197,13 @@ pub fn scan<R: Read + Seek>(reader: &mut R) -> Result<Scan> {
         }
         let key_len = u32_at(16) as usize;
         let val_len = u32_at(20) as usize;
-        if key_len > MAX_KEY || val_len > MAX_VALUE || (h[4] == 1 && val_len != 0) {
+        let lengths_valid = match h[4] {
+            0 => key_len <= MAX_KEY && val_len <= MAX_VALUE,
+            1 => key_len <= MAX_KEY && val_len == 0,
+            2 => key_len == 0 && (4..=MAX_BATCH_BYTES).contains(&val_len),
+            _ => unreachable!(),
+        };
+        if !lengths_valid {
             return Err(corrupt("invalid record lengths"));
         }
         let payload_len = key_len + val_len;
@@ -117,11 +215,28 @@ pub fn scan<R: Read + Seek>(reader: &mut R) -> Result<Scan> {
         if crc32(&payload) != u32_at(24) {
             return Err(corrupt("payload checksum mismatch"));
         }
-        if h[4] == 1 {
-            result.entries.remove(&payload[..key_len]);
-        } else {
-            let value = payload.split_off(key_len);
-            result.entries.insert(payload, value);
+        match h[4] {
+            0 => {
+                let value = payload.split_off(key_len);
+                result.entries.insert(payload, value);
+            }
+            1 => {
+                result.entries.remove(&payload[..key_len]);
+            }
+            2 => {
+                let operations = decode_batch(&payload).map_err(corrupt)?;
+                for operation in operations {
+                    match operation {
+                        Operation::Put(key, value) => {
+                            result.entries.insert(key.to_vec(), value.to_vec());
+                        }
+                        Operation::Delete(key) => {
+                            result.entries.remove(key);
+                        }
+                    }
+                }
+            }
+            _ => unreachable!(),
         }
         result.records = seq;
         result.valid_bytes += RECORD_HEADER as u64 + payload_len as u64;

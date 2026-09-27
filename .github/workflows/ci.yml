@@ -21,6 +21,7 @@ jobs:
       - run: cargo test --locked
       - run: cargo test --locked --all-features
       - run: cargo build --release --locked
+      - run: python3 scripts/batch_demo.py target/release/durablestore
       - run: cargo build --locked --features fault-injection
       - run: python3 scripts/crash_demo.py target/debug/durablestore
   minimum-rust:

@@ -1,4 +1,4 @@
-# DurableStore design and implementation plan
+# DurableStore design
 
 Original single-writer embedded byte key/value store, MIT, copyright nazeeh111.
 The user delegated design decisions and implementation. This scope fills the storage-systems portfolio gap with inspectable persistence behavior.
@@ -15,16 +15,14 @@ Compaction writes sorted live data into a temporary log, synchronizes it, atomic
 
 ## Interfaces
 
-Library `Store::open`, `get`, `put`, `delete`, `entries`, `compact`, `stats`.
-CLI `durablestore <directory> init|put|get|delete|list|inspect|compact`; byte arguments encoded as hex, consistent JSON results and errors. CLI get missing returns code 3. Inspector scans without changing files (including truncated tails) under lock.
+Library `Store::open`, `get`, `put`, `delete`, `write_batch`, `entries`, `compact`, `stats`.
+CLI `durablestore <directory> init|put|get|delete|batch|list|inspect|compact`; byte arguments encoded as hex, consistent JSON results and errors. CLI get missing returns code 3. Inspector scans without changing files (including truncated tails) under lock.
 
-## Implementation sequence
+## Atomic grouped writes
 
-1. Write API/format contract tests, observe failure, implement codec and core store.
-2. Add model-based operation/reopen/compaction tests and corruption/truncation coverage.
-3. Add CLI and subprocess crash tests using compile-time-only fault injection, not default binary behavior.
-4. Add reproducible benchmark and crash demonstration, docs, and Linux/macOS CI.
-5. Run formatting, tests, strict Clippy, release build and actual benchmark. Review recovery/error paths, record evidence and limits in HANDOFF.
+A batch holds up to 1,024 ordered mutations in one checksummed record with a 32 MiB payload limit. Encoding validates the entire input before appending; replay validates the entire payload before changing the index. One synchronization acknowledges the group. This avoids commit markers and a pending-transaction recovery state, at the cost of a bounded in-memory batch. Empty batches do not append. An error after persistence begins poisons the handle, including errors after the record may have reached disk.
+
+The new record tag preserves old logs without an in-place format migration. Old readers reject batch records. Compaction emits the live state as ordinary puts. Interactive transactions, compare-and-swap and reader snapshots are separate contracts and are not implemented.
 
 ## Alternatives considered
 

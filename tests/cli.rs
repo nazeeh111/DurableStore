@@ -171,3 +171,136 @@ fn normal_binary_ignores_fault_environment() {
         .unwrap();
     assert!(o.status.success());
 }
+
+#[test]
+fn batch_file_is_atomic_and_invalid_input_does_not_open_store() {
+    let d = Dir::new();
+    assert!(run(&d, &["init"]).status.success());
+    assert!(run(&d, &["put", "61", "31"]).status.success());
+    let input = d.0.join("changes.tsv");
+    fs::write(&input, "put\t62\t32\ndelete\t61\nput\t\t\n").unwrap();
+    let result = run(&d, &["batch", input.to_str().unwrap()]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        "{\"ok\":true,\"durable\":true,\"operations\":3}\n"
+    );
+    assert_eq!(run(&d, &["get", "61"]).status.code(), Some(3));
+    assert!(run(&d, &["get", "62"]).status.success());
+    assert!(run(&d, &["get", ""]).status.success());
+    for invalid in [
+        "put\t63\t33\ndelete\tz0\n",
+        "put 63 33\n",
+        "",
+        "\n",
+        "put\t63\t33\textra\n",
+    ] {
+        fs::write(&input, invalid).unwrap();
+        let before = fs::read(d.0.join("data.wal")).unwrap();
+        let result = run(&d, &["batch", input.to_str().unwrap()]);
+        assert_eq!(result.status.code(), Some(2));
+        assert_eq!(fs::read(d.0.join("data.wal")).unwrap(), before);
+        assert!(result.stdout.is_empty());
+    }
+    let fresh = Dir::new();
+    assert_eq!(
+        run(&fresh, &["batch", input.to_str().unwrap()])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert!(!fresh.0.join("LOCK").exists());
+}
+
+#[test]
+fn batch_stdin_handles_crlf_and_ordered_duplicate_keys() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let d = Dir::new();
+    assert!(run(&d, &["init"]).status.success());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_durablestore"))
+        .arg(&d.0)
+        .args(["batch", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"put\t61\t31\r\ndelete\t61\r\nput\t61\t32\r\n")
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        run(&d, &["get", "61"]).stdout,
+        b"{\"found\":true,\"value_hex\":\"32\"}\n"
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn batch_process_crash_never_exposes_partial_outbox_transition() {
+    for point in ["append_header", "append_payload", "append_sync"] {
+        let d = Dir::new();
+        assert!(run(&d, &["init"]).status.success());
+        assert!(run(&d, &["put", "61", "31"]).status.success());
+        assert!(run(&d, &["put", "62", "32"]).status.success());
+        let input = d.0.join("changes.tsv");
+        fs::write(&input, "delete\t61\nput\t62\t33\nput\t63\t34\n").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_durablestore"))
+            .arg(&d.0)
+            .args(["batch", input.to_str().unwrap()])
+            .env("DURABLESTORE_FAIL_AT", point)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(86), "{point}");
+        let reopened = run(&d, &["list"]);
+        assert!(reopened.status.success());
+        let expected: &[u8] = if point == "append_header" {
+            b"{\"entries\":[{\"key_hex\":\"61\",\"value_hex\":\"31\"},{\"key_hex\":\"62\",\"value_hex\":\"32\"}]}\n"
+        } else {
+            b"{\"entries\":[{\"key_hex\":\"62\",\"value_hex\":\"33\"},{\"key_hex\":\"63\",\"value_hex\":\"34\"}]}\n"
+        };
+        assert_eq!(reopened.stdout, expected, "{point}");
+        assert!(run(&d, &["put", "64", "35"]).status.success());
+        assert!(run(&d, &["compact"]).status.success());
+        assert!(run(&d, &["get", "64"]).status.success());
+    }
+}
+
+#[test]
+fn batch_limits_and_invalid_utf8_preserve_an_unrepaired_tail() {
+    use std::io::Write;
+    let d = Dir::new();
+    assert!(run(&d, &["init"]).status.success());
+    fs::OpenOptions::new()
+        .append(true)
+        .open(d.0.join("data.wal"))
+        .unwrap()
+        .write_all(b"tail")
+        .unwrap();
+    let before = fs::read(d.0.join("data.wal")).unwrap();
+    let input = d.0.join("changes.tsv");
+    for contents in [
+        b"put\t61\t31\n\xff".to_vec(),
+        "put\t61\t31\n".repeat(1025).into_bytes(),
+    ] {
+        fs::write(&input, contents).unwrap();
+        assert_eq!(
+            run(&d, &["batch", input.to_str().unwrap()]).status.code(),
+            Some(2)
+        );
+        assert_eq!(fs::read(d.0.join("data.wal")).unwrap(), before);
+    }
+}

@@ -1,4 +1,4 @@
-use durablestore::Store;
+use durablestore::{MAX_BATCH_OPERATIONS, MAX_KEY, MAX_VALUE, Operation, Store};
 use std::{
     fs,
     sync::atomic::{AtomicU64, Ordering},
@@ -36,6 +36,183 @@ fn roundtrip_bytes_delete_and_reopen() {
     assert_eq!(s.get(b"key"), None);
     assert_eq!(s.get(b""), Some(b"".as_slice()));
     assert_eq!(s.get(&[0, 255]), Some([255, 0, 10].as_slice()));
+}
+
+#[test]
+fn batch_applies_mixed_operations_in_order_after_reopen() {
+    let d = Dir::new();
+    let mut s = Store::open(&d.0).unwrap();
+    s.put(b"keep", b"old").unwrap();
+    let before = s.stats().records;
+    s.write_batch(&[
+        Operation::Put(b"keep", b"new"),
+        Operation::Put(b"", b""),
+        Operation::Put(b"same", b"first"),
+        Operation::Delete(b"keep"),
+        Operation::Put(b"same", b"last"),
+        Operation::Delete(b"missing"),
+    ])
+    .unwrap();
+    assert_eq!(s.stats().records, before + 1);
+    drop(s);
+    let s = Store::open(&d.0).unwrap();
+    assert_eq!(s.get(b"keep"), None);
+    assert_eq!(s.get(b""), Some(b"".as_slice()));
+    assert_eq!(s.get(b"same"), Some(b"last".as_slice()));
+    assert_eq!(s.get(b"missing"), None);
+}
+
+#[test]
+fn incomplete_batch_never_replays_a_prefix() {
+    let base = Dir::new();
+    let mut s = Store::open(&base.0).unwrap();
+    s.put(b"safe", b"before").unwrap();
+    let prefix = s.stats().log_bytes as usize;
+    s.write_batch(&[
+        Operation::Put(b"safe", b"after"),
+        Operation::Put(b"new", b"value"),
+        Operation::Delete(b"absent"),
+    ])
+    .unwrap();
+    drop(s);
+    let bytes = fs::read(base.0.join("data.wal")).unwrap();
+    for cut in prefix..bytes.len() {
+        let d = Dir::new();
+        fs::write(d.0.join("data.wal"), &bytes[..cut]).unwrap();
+        let s = Store::open(&d.0).unwrap();
+        assert_eq!(s.get(b"safe"), Some(b"before".as_slice()), "cut {cut}");
+        assert_eq!(s.get(b"new"), None, "cut {cut}");
+        assert_eq!(s.stats().tail_bytes, (cut - prefix) as u64);
+        assert_eq!(
+            fs::metadata(d.0.join("data.wal")).unwrap().len(),
+            prefix as u64
+        );
+    }
+    let d = Dir::new();
+    fs::write(d.0.join("data.wal"), bytes).unwrap();
+    let s = Store::open(&d.0).unwrap();
+    assert_eq!(s.get(b"safe"), Some(b"after".as_slice()));
+    assert_eq!(s.get(b"new"), Some(b"value".as_slice()));
+}
+
+#[test]
+fn invalid_batch_is_rejected_before_writing_without_poisoning() {
+    let d = Dir::new();
+    let mut s = Store::open(&d.0).unwrap();
+    let before = s.stats();
+    s.write_batch(&[]).unwrap();
+    assert_eq!(s.stats(), before);
+    assert!(
+        s.write_batch(&[Operation::Put(&vec![0; MAX_KEY + 1], b"v")])
+            .is_err()
+    );
+    assert!(
+        s.write_batch(&[Operation::Put(b"k", &vec![0; MAX_VALUE + 1])])
+            .is_err()
+    );
+    let too_many = vec![Operation::Delete(b"k"); MAX_BATCH_OPERATIONS + 1];
+    assert!(s.write_batch(&too_many).is_err());
+    let large_value = vec![0; MAX_VALUE];
+    assert!(
+        s.write_batch(&[
+            Operation::Put(b"one", &large_value),
+            Operation::Put(b"two", &large_value),
+        ])
+        .is_err()
+    );
+    assert_eq!(s.stats(), before);
+    s.put(b"still", b"usable").unwrap();
+    assert_eq!(s.get(b"still"), Some(b"usable".as_slice()));
+}
+
+#[test]
+fn version_one_log_accepts_new_batch_without_migration() {
+    // Fixed version-one header and a put of legacy -> yes, created independently.
+    const FIXTURE: &str = "4453544f523030310100000036bbdf874453523100000000010000000000000006000000030000006568ef0b915536926c6567616379796573";
+    let bytes: Vec<u8> = FIXTURE
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    let d = Dir::new();
+    fs::write(d.0.join("data.wal"), bytes).unwrap();
+    let mut s = Store::open(&d.0).unwrap();
+    assert_eq!(s.get(b"legacy"), Some(b"yes".as_slice()));
+    s.write_batch(&[Operation::Delete(b"legacy"), Operation::Put(b"new", b"ok")])
+        .unwrap();
+    drop(s);
+    let s = Store::open(&d.0).unwrap();
+    assert_eq!(s.get(b"legacy"), None);
+    assert_eq!(s.get(b"new"), Some(b"ok".as_slice()));
+}
+
+fn test_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
+
+fn repair_record_checksums(record: &mut [u8]) {
+    let payload_crc = test_crc32(&record[32..]);
+    record[24..28].copy_from_slice(&payload_crc.to_le_bytes());
+    let header_crc = test_crc32(&record[..28]);
+    record[28..32].copy_from_slice(&header_crc.to_le_bytes());
+}
+
+#[test]
+fn complete_malformed_batch_fails_closed_without_repair() {
+    let base = Dir::new();
+    let mut s = Store::open(&base.0).unwrap();
+    s.put(b"safe", b"before").unwrap();
+    let prefix = s.stats().log_bytes as usize;
+    s.write_batch(&[
+        Operation::Put(b"safe", b"after"),
+        Operation::Put(b"new", b"value"),
+    ])
+    .unwrap();
+    drop(s);
+    let bytes = fs::read(base.0.join("data.wal")).unwrap();
+    for variant in 0..3 {
+        let d = Dir::new();
+        let mut damaged = bytes.clone();
+        let record = &mut damaged[prefix..];
+        match variant {
+            0 => record[32 + 4] = 7, // Unknown inner operation with valid outer CRCs.
+            1 => record[32..36].copy_from_slice(&1u32.to_le_bytes()), // Trailing member.
+            _ => record[32 + 5..32 + 9].copy_from_slice(&u32::MAX.to_le_bytes()),
+        }
+        repair_record_checksums(record);
+        fs::write(d.0.join("data.wal"), &damaged).unwrap();
+        assert!(matches!(
+            Store::open(&d.0),
+            Err(durablestore::Error::Corruption { .. })
+        ));
+        assert_eq!(fs::read(d.0.join("data.wal")).unwrap(), damaged);
+    }
+}
+
+#[test]
+fn corrupt_batch_payload_fails_closed_without_repair() {
+    let d = Dir::new();
+    let mut s = Store::open(&d.0).unwrap();
+    s.write_batch(&[Operation::Put(b"one", b"1"), Operation::Put(b"two", b"2")])
+        .unwrap();
+    drop(s);
+    let mut damaged = fs::read(d.0.join("data.wal")).unwrap();
+    damaged[16 + 32 + 4 + 9] ^= 0x80;
+    fs::write(d.0.join("data.wal"), &damaged).unwrap();
+    assert!(matches!(
+        Store::open(&d.0),
+        Err(durablestore::Error::Corruption { .. })
+    ));
+    assert_eq!(fs::read(d.0.join("data.wal")).unwrap(), damaged);
 }
 #[test]
 fn lock_is_exclusive_and_released() {
@@ -253,6 +430,74 @@ fn io_failure_child() {
     drop(s);
     let s = Store::open(&d.0).unwrap();
     assert_eq!(s.get(b"a"), Some(b"1".as_slice()));
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn batch_io_errors_poison_until_reopen_and_replay_all_or_none() {
+    for point in ["append_header", "append_payload", "append_sync"] {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "batch_io_failure_child", "--nocapture"])
+            .env("DURABLESTORE_BATCH_CHILD_POINT", point)
+            .env("DURABLESTORE_FAIL_AT", point)
+            .env("DURABLESTORE_FAIL_MODE", "error")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{point}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn batch_io_failure_child() {
+    let Ok(point) = std::env::var("DURABLESTORE_BATCH_CHILD_POINT") else {
+        return;
+    };
+    let d = Dir::new();
+    let seed = std::process::Command::new(env!("CARGO_BIN_EXE_durablestore"))
+        .arg(&d.0)
+        .arg("init")
+        .env_remove("DURABLESTORE_FAIL_AT")
+        .output()
+        .unwrap();
+    assert!(seed.status.success());
+    let seed = std::process::Command::new(env!("CARGO_BIN_EXE_durablestore"))
+        .arg(&d.0)
+        .args(["put", "73616665", "6265666f7265"])
+        .env_remove("DURABLESTORE_FAIL_AT")
+        .output()
+        .unwrap();
+    assert!(seed.status.success());
+    let mut s = Store::open(&d.0).unwrap();
+    assert!(
+        s.write_batch(&[
+            Operation::Put(b"safe", b"after"),
+            Operation::Put(b"new", b"value"),
+        ])
+        .is_err()
+    );
+    assert!(matches!(
+        s.write_batch(&[]),
+        Err(durablestore::Error::Poisoned)
+    ));
+    assert_eq!(s.get(b"safe"), Some(b"before".as_slice()));
+    assert_eq!(s.get(b"new"), None);
+    drop(s);
+    let s = Store::open(&d.0).unwrap();
+    let both_survived =
+        s.get(b"safe") == Some(b"after".as_slice()) && s.get(b"new") == Some(b"value".as_slice());
+    let neither_survived = s.get(b"safe") == Some(b"before".as_slice()) && s.get(b"new").is_none();
+    assert!(both_survived || neither_survived, "{point}");
+    if point == "append_header" {
+        assert!(neither_survived);
+    }
+    if point == "append_sync" {
+        assert!(both_survived);
+    }
 }
 #[test]
 fn unfinished_initial_file_is_rejected_and_preserved() {

@@ -36,11 +36,41 @@ fn save_result(directory: &std::path::Path) -> durablestore::Result<()> {
 }
 ```
 
+## Atomic batches
+
+Use a batch when related keys must change together. For example, mark a queued job complete while removing its pending entry and adding its result. A batch uses one checksummed record and one synchronization; recovery exposes all its changes or none.
+
+```rust
+use durablestore::{Operation, Store};
+
+fn complete_job(store: &mut Store) -> durablestore::Result<()> {
+    store.write_batch(&[
+        Operation::Put(b"job:42", b"complete"),
+        Operation::Delete(b"pending:42"),
+        Operation::Put(b"result:42", b"artifact.txt"),
+    ])
+}
+```
+
+The CLI reads a file or standard input. Fields are separated by literal tabs; keys and values are hexadecimal. Empty fields represent empty bytes. Input is validated before opening the store.
+
+```sh
+printf 'put\t6a6f623a3432\t636f6d706c657465\ndelete\t70656e64696e673a3432\n' > changes.tsv
+./target/release/durablestore demo-store batch changes.tsv
+# {"ok":true,"durable":true,"operations":2}
+```
+
+Run `python3 scripts/batch_demo.py target/release/durablestore` for a complete outbox-state example using disposable local data. It sends no messages.
+
+`batch -` reads standard input. Each line is `put<TAB>key<TAB>value` or `delete<TAB>key`. LF and CRLF are accepted; blank lines, extra fields and empty files are rejected. At most 1,024 operations and 32 MiB of encoded batch payload are allowed. Per-key and per-value limits still apply. Operations run in listed order, including repeated keys. An empty library batch does nothing; it still rejects a poisoned handle.
+
+Old single-operation logs remain readable. Older DurableStore binaries reject batch records; keep the new binary with stores that use batches. Compaction writes the resulting live state as ordinary put records. This is atomic grouped writing, without rollback commands, conditional updates or concurrent transactions. A complete batch may survive a crash even if the caller did not receive acknowledgement.
+
 ## Persistence contract
 
 | Event | Behavior |
 | --- | --- |
-| `put` / `delete` returns `Ok` | Complete record was written and `File::sync_all` succeeded. |
+| `put` / `delete` / `write_batch` returns `Ok` | Complete record was written and `File::sync_all` succeeded. |
 | Process dies before acknowledgement | That operation may be absent or present. Earlier acknowledged state survives under the supported filesystem contract. |
 | Incomplete terminal record | Opening discards only its incomplete bytes, synchronizes the repair, and reports the count in `Stats::tail_bytes`. |
 | Full record has bad checksum, bad lengths, or wrong sequence | Opening fails without modifying `data.wal`. |
@@ -101,6 +131,6 @@ The destination must not already exist. The benchmark writes each 256-byte value
 
 ## Supported scope
 
-Maximum key: **1 MiB**. Maximum value: **16 MiB**. Empty keys and values work. Startup is linear in log bytes and holds all live data in RAM; compaction needs temporary disk space for the full live set. There is no multi-key transaction, SQL, replication, encryption, TTL, concurrent reader process, background compaction, or network-filesystem support. Data directories must be trusted: this is not a hardened service that accepts arbitrary paths from hostile clients. Compaction removes historical versions, so preserve an offline copy if you need a forensic history.
+Maximum key: **1 MiB**. Maximum value: **16 MiB**. Empty keys and values work. Startup is linear in log bytes and holds all live data in RAM; compaction needs temporary disk space for the full live set. There is no interactive transaction, SQL, replication, encryption, TTL, concurrent reader process, background compaction, or network-filesystem support. Data directories must be trusted: this is not a hardened service that accepts arbitrary paths from hostile clients. Compaction removes historical versions, so preserve an offline copy if you need a forensic history.
 
 MIT licensed; copyright nazeeh111.

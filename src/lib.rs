@@ -1,12 +1,12 @@
 //! A single-writer embedded byte store with synchronized append-only records.
 //!
 //! A successful mutation has been synchronized to the filesystem. Recovery may
-//! also retain complete unacknowledged records. This is not a transaction engine.
+//! also retain complete unacknowledged records. Batches are atomic log records.
 #![forbid(unsafe_code)]
 #[cfg(not(unix))]
 compile_error!("DurableStore currently supports local Unix filesystems (Linux/macOS) only");
 mod format;
-pub use format::{MAX_KEY, MAX_VALUE};
+pub use format::{MAX_BATCH_BYTES, MAX_BATCH_OPERATIONS, MAX_KEY, MAX_VALUE};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -16,6 +16,13 @@ use std::{
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// A byte operation in an ordered, atomic write batch.
+#[derive(Debug, Clone, Copy)]
+pub enum Operation<'a> {
+    Put(&'a [u8], &'a [u8]),
+    Delete(&'a [u8]),
+}
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
@@ -189,6 +196,36 @@ impl Store {
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
         self.mutate(key, None)
     }
+    /// Append and synchronize all operations as one log record before updating memory.
+    /// Repeated keys take their last operation in slice order. An empty batch is a no-op.
+    pub fn write_batch(&mut self, operations: &[Operation<'_>]) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let seq = self
+            .records
+            .checked_add(1)
+            .ok_or(Error::InvalidInput("sequence exhausted; compact first"))?;
+        let record = format::encode_batch(seq, operations)?;
+        self.append_record(&record)?;
+        for operation in operations {
+            match operation {
+                Operation::Put(key, value) => {
+                    self.entries.insert(key.to_vec(), value.to_vec());
+                }
+                Operation::Delete(key) => {
+                    self.entries.remove(*key);
+                }
+            }
+        }
+        self.records = seq;
+        self.bytes += record.len() as u64;
+        self.poisoned = false;
+        Ok(())
+    }
     fn mutate(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         if self.poisoned {
             return Err(Error::Poisoned);
@@ -198,14 +235,7 @@ impl Store {
             .checked_add(1)
             .ok_or(Error::InvalidInput("sequence exhausted; compact first"))?;
         let record = format::encode(seq, key, value)?;
-        // From the first I/O until acknowledgement, any failure requires reopen.
-        self.poisoned = true;
-        self.log.write_all(&record[..format::RECORD_HEADER])?;
-        fault("append_header")?;
-        self.log.write_all(&record[format::RECORD_HEADER..])?;
-        fault("append_payload")?;
-        self.log.sync_all()?;
-        fault("append_sync")?;
+        self.append_record(&record)?;
         match value {
             Some(v) => {
                 self.entries.insert(key.to_vec(), v.to_vec());
@@ -217,6 +247,17 @@ impl Store {
         self.records = seq;
         self.bytes += record.len() as u64;
         self.poisoned = false;
+        Ok(())
+    }
+    fn append_record(&mut self, record: &[u8]) -> Result<()> {
+        // From the first I/O until acknowledgement, any failure requires reopen.
+        self.poisoned = true;
+        self.log.write_all(&record[..format::RECORD_HEADER])?;
+        fault("append_header")?;
+        self.log.write_all(&record[format::RECORD_HEADER..])?;
+        fault("append_payload")?;
+        self.log.sync_all()?;
+        fault("append_sync")?;
         Ok(())
     }
     /// Rewrite current live keys atomically, keeping the separate lock inode stable.

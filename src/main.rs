@@ -1,6 +1,8 @@
-use durablestore::{MAX_KEY, MAX_VALUE, Stats, Store};
-use std::{fmt::Write, path::Path};
-const USAGE: &str = "durablestore <existing-directory> init | put <key-hex> <value-hex> | get <key-hex> | delete <key-hex> | list | inspect | compact";
+use durablestore::{
+    MAX_BATCH_BYTES, MAX_BATCH_OPERATIONS, MAX_KEY, MAX_VALUE, Operation, Stats, Store,
+};
+use std::{fmt::Write, io::Read, path::Path};
+const USAGE: &str = "durablestore <existing-directory> init | put <key-hex> <value-hex> | get <key-hex> | delete <key-hex> | batch <file|-> | list | inspect | compact";
 fn quote(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
@@ -46,6 +48,58 @@ fn decode(s: &str, max: usize) -> Result<Vec<u8>, String> {
         })
         .collect()
 }
+type BatchEntry = (Vec<u8>, Option<Vec<u8>>);
+
+fn read_batch(path: &str) -> Result<Vec<BatchEntry>, String> {
+    // Hex expands bytes twofold; allow command names, tabs and CRLF per member.
+    let limit = 2 * MAX_BATCH_BYTES + 16 * MAX_BATCH_OPERATIONS;
+    let input: Box<dyn Read> = if path == "-" {
+        Box::new(std::io::stdin())
+    } else {
+        Box::new(std::fs::File::open(path).map_err(|e| format!("batch file: {e}"))?)
+    };
+    let mut bytes = Vec::new();
+    input
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("batch input: {e}"))?;
+    if bytes.len() > limit {
+        return Err("batch input exceeds text size limit".into());
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| "batch input must be UTF-8")?;
+    let mut entries = Vec::new();
+    let mut payload_bytes = 4usize;
+    for (line_number, line) in text.lines().enumerate() {
+        if entries.len() == MAX_BATCH_OPERATIONS {
+            return Err("batch exceeds 1024 operations".into());
+        }
+        let mut fields = line.split('\t');
+        let command = fields.next().unwrap_or_default();
+        let key = fields.next();
+        let value = fields.next();
+        let fail = |message: &str| format!("batch line {}: {message}", line_number + 1);
+        let entry = match (command, key, value, fields.next()) {
+            ("put", Some(key), Some(value), None) => (
+                decode(key, MAX_KEY).map_err(|e| fail(&e))?,
+                Some(decode(value, MAX_VALUE).map_err(|e| fail(&e))?),
+            ),
+            ("delete", Some(key), None, None) => {
+                (decode(key, MAX_KEY).map_err(|e| fail(&e))?, None)
+            }
+            _ => return Err(fail("expected tab-separated put/key/value or delete/key")),
+        };
+        payload_bytes += 9 + entry.0.len() + entry.1.as_ref().map_or(0, Vec::len);
+        if payload_bytes > MAX_BATCH_BYTES {
+            return Err("batch payload exceeds 32 MiB".into());
+        }
+        entries.push(entry);
+    }
+    if entries.is_empty() {
+        return Err("batch input contains no operations".into());
+    }
+    Ok(entries)
+}
+
 fn stats(s: &Stats) -> String {
     format!(
         "{{\"live_keys\":{},\"live_bytes\":{},\"records\":{},\"log_bytes\":{},\"tail_bytes\":{}}}",
@@ -61,14 +115,19 @@ fn run(args: &[String]) -> Result<(String, i32), String> {
     }
     let expected = match args[1].as_str() {
         "put" => 4,
-        "get" | "delete" => 3,
+        "get" | "delete" | "batch" => 3,
         "init" | "list" | "inspect" | "compact" => 2,
         _ => return Err(USAGE.into()),
     };
     if args.len() != expected {
         return Err(USAGE.into());
     }
-    let key = if expected >= 3 {
+    let batch = if args[1] == "batch" {
+        Some(read_batch(&args[2])?)
+    } else {
+        None
+    };
+    let key = if expected >= 3 && args[1] != "batch" {
         decode(&args[2], MAX_KEY)?
     } else {
         vec![]
@@ -97,6 +156,24 @@ fn run(args: &[String]) -> Result<(String, i32), String> {
         "delete" => {
             store.delete(&key).map_err(|e| e.to_string())?;
             Ok(("{\"ok\":true,\"durable\":true}".into(), 0))
+        }
+        "batch" => {
+            let entries = batch.as_ref().unwrap();
+            let operations: Vec<_> = entries
+                .iter()
+                .map(|(key, value)| match value {
+                    Some(value) => Operation::Put(key, value),
+                    None => Operation::Delete(key),
+                })
+                .collect();
+            store.write_batch(&operations).map_err(|e| e.to_string())?;
+            Ok((
+                format!(
+                    "{{\"ok\":true,\"durable\":true,\"operations\":{}}}",
+                    operations.len()
+                ),
+                0,
+            ))
         }
         "get" => match store.get(&key) {
             Some(v) => Ok((
