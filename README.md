@@ -4,8 +4,6 @@
 
 DurableStore stores byte keys and values in a checksummed log with bounded recovery, an exclusive writer lock and atomic compaction. It includes a Rust library, a JSON command-line interface, a crash-recovery demonstration and a repeatable benchmark.
 
-**Development history:** Developed locally with Git before publication.
-
 ## Try it
 
 Requirements: Rust 1.89 or newer, Linux or macOS, and a local filesystem. No third-party Rust dependencies, server, account, or network access at runtime.
