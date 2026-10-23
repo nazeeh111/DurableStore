@@ -125,7 +125,7 @@ cargo run --release --locked --example benchmark -- ./bench-store 1000 > benchma
 
 The destination must not already exist. The benchmark writes each 256-byte value twice with a sync per operation, reads warm in-memory keys, deletes a quarter of keys, compacts, and verifies every remaining key after reopening. JSON includes p50/p95/p99 latency, operation counts, compiler/OS/CPU details, log sizes, and compaction/reopen time. The directory is retained for inspection. Read timings measure the memory index, not disk lookup. Short microbenchmarks are sensitive to timer overhead, cache state, filesystem, and competing work; no cross-engine performance claim is made.
 
-[Measured local run](docs/benchmark.json) and [verification record](docs/verification.md).
+[Measured v0.1.0 single-operation baseline](docs/benchmark.json) and [verification record](docs/verification.md). The retained benchmark predates atomic batches; it is not a v0.2.0 batch measurement.
 
 ## Supported scope
 
