@@ -1,7 +1,6 @@
 # DurableStore design
 
 Original single-writer embedded byte key/value store, MIT, copyright nazeeh111.
-The user delegated design decisions and implementation. This scope fills the storage-systems portfolio gap with inspectable persistence behavior.
 
 ## Contract
 
