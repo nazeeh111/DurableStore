@@ -2,13 +2,17 @@
 
 **A Rust key-value store with synchronized writes and crash recovery.**
 
-DurableStore stores byte keys and values in a checksummed log with bounded recovery, an exclusive writer lock and atomic compaction. It includes a Rust library, a JSON command-line interface, a crash-recovery demonstration and a repeatable benchmark.
+Store byte keys and values through a Rust library or JSON command line. A checksummed log, bounded recovery, exclusive writer lock and atomic compaction define the persistence contract.
+
+[Inspect the eight-boundary process-crash record](docs/crash-demo.json) or [run the crash demonstration](#crash-recovery-checks). This record tests process termination, not hardware power loss.
 
 ## Try it
 
 Requirements: Rust 1.89 or newer, Linux or macOS, and a local filesystem. No third-party Rust dependencies, server, account, or network access at runtime.
 
 ```sh
+git clone https://github.com/nazeeh111/DurableStore.git
+cd DurableStore
 cargo build --release --locked
 mkdir demo-store
 ./target/release/durablestore demo-store init
