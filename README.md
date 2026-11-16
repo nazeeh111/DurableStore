@@ -20,8 +20,17 @@ mkdir demo-store
 ./target/release/durablestore demo-store get 68656c6c6f
 # {"found":true,"value_hex":"776f726c64"} means hello -> world
 ./target/release/durablestore demo-store inspect
+./target/release/durablestore demo-store health
 ./target/release/durablestore demo-store compact
 ```
+
+The sequence creates a store, writes `hello → world`, reads it back and compacts
+the log. The `get` value is hexadecimal for `world`. Both `inspect` and `health`
+scan without repairing the log; a normal open can repair an incomplete tail.
+Use `durablestore --help` for JSON usage and `--version` for the source version.
+
+This checkout identifies itself as `0.2.1-dev.0`. The [v0.2.0 release](https://github.com/nazeeh111/DurableStore/releases/tag/v0.2.0)
+is historical and does not contain the new `health` operation.
 
 Keys and values use hexadecimal in the CLI, allowing arbitrary bytes. `""` represents empty bytes. `list` returns keys in byte-sorted order. `delete <key-hex>` appends a tombstone, including for absent keys. `get` exits with code **3** for a missing key; operational/input errors exit **2** with a JSON error on stderr. Successful commands emit JSON on stdout and exit **0**. Only `init` creates a database; the directory must already exist. The library supports values larger than common shell argument limits.
 
@@ -79,6 +88,8 @@ Old single-operation logs remain readable. Older DurableStore binaries reject ba
 | Append or compaction fails | Further writes are rejected on that handle. Drop and reopen to determine the persisted state. Reads on the old handle remain its last acknowledged in-memory state. |
 | Another handle owns the store | Open and inspection fail immediately instead of waiting indefinitely. |
 | Compaction is interrupted | Recovery uses the original log or the atomically replaced compacted log. Both represent the same live state. |
+
+`health` takes the same exclusive lock and validates the whole available log without reconstructing live keys. It reports `good`, `truncated`, `corrupt` or `sequence_error`, the validated record count and byte prefix, total bytes, and the first incomplete or invalid record offset. Exit 0 means good, 3 means an incomplete or corrupt log, and 2 means an I/O, lock or invocation failure. Bytes beyond an invalid record have not been validated; a truncated suffix follows the same rule as recovery. It never repairs or creates a store. Memory is bounded by one record (up to the 32 MiB batch limit plus operation metadata), not total live data. The lock excludes cooperating store handles, not programs that modify files directly. CRC is not authentication.
 
 `inspect` acquires the lock and scans without creating files or repairing a tail. Ordinary opens can repair a tail. All commands require exclusive access; this intentionally avoids a second concurrent-reader consistency contract. Never delete or replace `LOCK`, or rename/delete the store directory, while any handle is open.
 

@@ -1,6 +1,7 @@
 use crate::{Error, Operation, Result};
 use std::io::{Read, Seek, SeekFrom};
 
+pub const SEQUENCE_ERROR: &str = "record sequence mismatch";
 pub const FILE_HEADER: usize = 16;
 pub const RECORD_HEADER: usize = 32;
 pub const MAX_KEY: usize = 1024 * 1024;
@@ -153,8 +154,26 @@ pub struct Scan {
     pub tail_bytes: u64,
 }
 
-pub fn scan<R: Read + Seek>(reader: &mut R) -> Result<Scan> {
+#[derive(Default)]
+pub struct ScanSummary {
+    pub records: u64,
+    pub valid_bytes: u64,
+    pub tail_bytes: u64,
+    pub log_bytes: u64,
+}
+
+// One decoder owns header, checksum, sequence and complete-batch validation.
+// The callback receives only fully validated records; it cannot retain borrows.
+pub fn scan_records<R: Read + Seek>(
+    reader: &mut R,
+    summary: &mut ScanSummary,
+    mut consume: impl FnMut(&[Operation<'_>]),
+) -> Result<()> {
     let len = reader.seek(SeekFrom::End(0))?;
+    *summary = ScanSummary {
+        log_bytes: len,
+        ..Default::default()
+    };
     reader.rewind()?;
     if len < FILE_HEADER as u64 {
         return Err(Error::Corruption {
@@ -170,14 +189,9 @@ pub fn scan<R: Read + Seek>(reader: &mut R) -> Result<Scan> {
             reason: "bad file header or unsupported version",
         });
     }
-    let mut result = Scan {
-        entries: Default::default(),
-        records: 0,
-        valid_bytes: FILE_HEADER as u64,
-        tail_bytes: 0,
-    };
-    while result.valid_bytes < len {
-        let at = result.valid_bytes;
+    summary.valid_bytes = FILE_HEADER as u64;
+    while summary.valid_bytes < len {
+        let at = summary.valid_bytes;
         if len - at < RECORD_HEADER as u64 {
             break;
         }
@@ -192,8 +206,8 @@ pub fn scan<R: Read + Seek>(reader: &mut R) -> Result<Scan> {
             return Err(corrupt("record header checksum mismatch"));
         }
         let seq = u64::from_le_bytes(h[8..16].try_into().unwrap());
-        if result.records.checked_add(1) != Some(seq) {
-            return Err(corrupt("record sequence mismatch"));
+        if summary.records.checked_add(1) != Some(seq) {
+            return Err(corrupt(SEQUENCE_ERROR));
         }
         let key_len = u32_at(16) as usize;
         let val_len = u32_at(20) as usize;
@@ -216,33 +230,42 @@ pub fn scan<R: Read + Seek>(reader: &mut R) -> Result<Scan> {
             return Err(corrupt("payload checksum mismatch"));
         }
         match h[4] {
-            0 => {
-                let value = payload.split_off(key_len);
-                result.entries.insert(payload, value);
-            }
-            1 => {
-                result.entries.remove(&payload[..key_len]);
-            }
+            0 => consume(&[Operation::Put(&payload[..key_len], &payload[key_len..])]),
+            1 => consume(&[Operation::Delete(&payload[..key_len])]),
             2 => {
                 let operations = decode_batch(&payload).map_err(corrupt)?;
-                for operation in operations {
-                    match operation {
-                        Operation::Put(key, value) => {
-                            result.entries.insert(key.to_vec(), value.to_vec());
-                        }
-                        Operation::Delete(key) => {
-                            result.entries.remove(key);
-                        }
-                    }
-                }
+                consume(&operations);
             }
             _ => unreachable!(),
         }
-        result.records = seq;
-        result.valid_bytes += RECORD_HEADER as u64 + payload_len as u64;
+        summary.records = seq;
+        summary.valid_bytes += RECORD_HEADER as u64 + payload_len as u64;
     }
-    result.tail_bytes = len - result.valid_bytes;
-    Ok(result)
+    summary.tail_bytes = len - summary.valid_bytes;
+    Ok(())
+}
+
+pub fn scan<R: Read + Seek>(reader: &mut R) -> Result<Scan> {
+    let mut entries = std::collections::BTreeMap::new();
+    let mut summary = ScanSummary::default();
+    scan_records(reader, &mut summary, |operations| {
+        for operation in operations {
+            match operation {
+                Operation::Put(key, value) => {
+                    entries.insert(key.to_vec(), value.to_vec());
+                }
+                Operation::Delete(key) => {
+                    entries.remove(*key);
+                }
+            }
+        }
+    })?;
+    Ok(Scan {
+        entries,
+        records: summary.records,
+        valid_bytes: summary.valid_bytes,
+        tail_bytes: summary.tail_bytes,
+    })
 }
 
 #[cfg(test)]

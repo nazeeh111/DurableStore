@@ -304,3 +304,20 @@ fn batch_limits_and_invalid_utf8_preserve_an_unrepaired_tail() {
         assert_eq!(fs::read(d.0.join("data.wal")).unwrap(), before);
     }
 }
+
+#[test]
+fn help_and_version_identify_current_source() {
+    let binary = env!("CARGO_BIN_EXE_durablestore");
+    let help = Command::new(binary).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(text.contains("\"usage\":"));
+    assert!(text.contains("Read-only log scan"));
+    assert!(text.contains("ordinary opens can repair an incomplete tail"));
+    let version = Command::new(binary).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        format!("{{\"version\":\"{}\"}}", env!("CARGO_PKG_VERSION"))
+    );
+}

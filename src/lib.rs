@@ -309,6 +309,64 @@ pub fn inspect(dir: impl AsRef<Path>) -> Result<Stats> {
     })
 }
 
+/// Structural status of the log under the cooperative exclusive store lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthStatus {
+    Good,
+    Truncated,
+    Corrupt,
+    SequenceError,
+}
+
+/// Only the validated prefix is counted. This does not reconstruct live keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogHealth {
+    pub status: HealthStatus,
+    pub records: u64,
+    pub valid_bytes: u64,
+    pub log_bytes: u64,
+    /// Bytes after the validated prefix; for corruption these have not been checked.
+    pub remaining_bytes: u64,
+    pub error_offset: Option<u64>,
+    pub reason: Option<&'static str>,
+}
+
+/// Read-only structural verification; takes the same exclusive lock as recovery.
+/// Working memory is bounded by the largest permitted record, not live data size.
+pub fn log_health(dir: impl AsRef<Path>) -> Result<LogHealth> {
+    let dir = dir.as_ref();
+    let _guard = lock(dir, false)?;
+    let mut file = File::open(dir.join("data.wal"))?;
+    let mut summary = format::ScanSummary::default();
+    let scan = format::scan_records(&mut file, &mut summary, |_| {});
+    let (status, error_offset, reason) = match scan {
+        Ok(()) if summary.tail_bytes > 0 => (
+            HealthStatus::Truncated,
+            Some(summary.valid_bytes),
+            Some("incomplete terminal record"),
+        ),
+        Ok(()) => (HealthStatus::Good, None, None),
+        Err(Error::Corruption { offset, reason }) => {
+            let status = if reason == format::SEQUENCE_ERROR {
+                HealthStatus::SequenceError
+            } else {
+                HealthStatus::Corrupt
+            };
+            (status, Some(offset), Some(reason))
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(LogHealth {
+        status,
+        records: summary.records,
+        valid_bytes: summary.valid_bytes,
+        log_bytes: summary.log_bytes,
+        remaining_bytes: summary.log_bytes - summary.valid_bytes,
+        error_offset,
+        reason,
+    })
+}
+
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 pub struct ReadmeExamples;

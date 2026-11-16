@@ -1,8 +1,9 @@
 use durablestore::{
-    MAX_BATCH_BYTES, MAX_BATCH_OPERATIONS, MAX_KEY, MAX_VALUE, Operation, Stats, Store,
+    HealthStatus, MAX_BATCH_BYTES, MAX_BATCH_OPERATIONS, MAX_KEY, MAX_VALUE, Operation, Stats,
+    Store,
 };
 use std::{fmt::Write, io::Read, path::Path};
-const USAGE: &str = "durablestore <existing-directory> init | put <key-hex> <value-hex> | get <key-hex> | delete <key-hex> | batch <file|-> | list | inspect | compact";
+const USAGE: &str = "durablestore <existing-directory> init | put <key-hex> <value-hex> | get <key-hex> | delete <key-hex> | batch <file|-> | list | inspect | health | compact";
 fn quote(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
@@ -108,7 +109,19 @@ fn stats(s: &Stats) -> String {
 }
 fn run(args: &[String]) -> Result<(String, i32), String> {
     if args == ["--help"] || args == ["-h"] {
-        return Ok((format!("{{\"usage\":{}}}", quote(USAGE)), 0));
+        return Ok((
+            format!(
+                "{{\"usage\":{},\"bytes\":\"Keys and values are hex; use empty strings for empty bytes.\",\"health\":\"Read-only log scan: exit 0 good, 3 incomplete or corrupt, 2 error.\",\"inspect\":\"Read-only live-state scan; ordinary opens can repair an incomplete tail.\"}}",
+                quote(USAGE)
+            ),
+            0,
+        ));
+    }
+    if args == ["--version"] {
+        return Ok((
+            format!("{{\"version\":{}}}", quote(env!("CARGO_PKG_VERSION"))),
+            0,
+        ));
     }
     if args.len() < 2 {
         return Err(USAGE.into());
@@ -116,7 +129,7 @@ fn run(args: &[String]) -> Result<(String, i32), String> {
     let expected = match args[1].as_str() {
         "put" => 4,
         "get" | "delete" | "batch" => 3,
-        "init" | "list" | "inspect" | "compact" => 2,
+        "init" | "list" | "inspect" | "health" | "compact" => 2,
         _ => return Err(USAGE.into()),
     };
     if args.len() != expected {
@@ -138,6 +151,31 @@ fn run(args: &[String]) -> Result<(String, i32), String> {
         vec![]
     };
     let dir = Path::new(&args[0]);
+    if args[1] == "health" {
+        let report = durablestore::log_health(dir).map_err(|e| e.to_string())?;
+        let status = match report.status {
+            HealthStatus::Good => "good",
+            HealthStatus::Truncated => "truncated",
+            HealthStatus::Corrupt => "corrupt",
+            HealthStatus::SequenceError => "sequence_error",
+        };
+        let offset = report
+            .error_offset
+            .map_or("null".to_string(), |v| v.to_string());
+        let reason = report.reason.map_or("null".to_string(), quote);
+        let code = if report.status == HealthStatus::Good {
+            0
+        } else {
+            3
+        };
+        return Ok((
+            format!(
+                "{{\"status\":\"{status}\",\"records\":{},\"valid_bytes\":{},\"log_bytes\":{},\"remaining_bytes\":{},\"error_offset\":{offset},\"reason\":{reason}}}",
+                report.records, report.valid_bytes, report.log_bytes, report.remaining_bytes
+            ),
+            code,
+        ));
+    }
     if args[1] == "inspect" {
         return durablestore::inspect(dir)
             .map(|s| (stats(&s), 0))

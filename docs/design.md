@@ -26,3 +26,5 @@ The new record tag preserves old logs without an in-place format migration. Old 
 ## Alternatives considered
 
 An LSM tree offers disk-scale reads but adds sorted table/version lifetimes before this durability contract is established. SQLite bindings provide useful applications but do not show original persistence logic. A BTreeMap index plus append-only WAL keeps the first implementation inspectable and testable; no SQL/MVCC claims.
+
+The read-only health scan shares recovery's record, batch, CRC and sequence validation but discards each validated payload instead of assembling a live index. It reports the valid prefix and the first incomplete/corrupt record. It does not claim live-key counts or protect against noncooperating modifications.
