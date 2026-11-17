@@ -153,11 +153,29 @@ printf 'put\t6a6f623a3432\t636f6d706c657465\ndelete\t70656e64696e673a3432\n' > c
 # {"ok":true,"durable":true,"operations":2}
 ```
 
+To apply a batch only if a key still has the value you observed, append
+`if <key-hex> <value-hex>`. For example, the following transition requires
+`job:42` to still contain `queued`:
+
+```sh
+./target/release/durablestore demo-store batch changes.tsv if 6a6f623a3432 717565756564
+```
+
+Use `absent` to require a missing key, or `""` to require a present key
+holding zero bytes. The comparison and all writes share the exclusive store
+handle. A mismatch appends no record, prints
+`{"ok":false,"reason":"condition_failed"}` and exits 3. A busy lock is an
+operational error (exit 2). Opening the store can still repair an incomplete
+log tail before evaluating the guard. Both guard arguments accept the same bounded
+`@FILE` or `@-` inputs as `get` and `put`. At most one input can use stdin.
+The comparison observes the current bytes. To detect a change away and back,
+use a fresh version token for each transition and update it in the same batch.
+
 Run `python3 scripts/batch_demo.py target/release/durablestore` for a complete outbox-state example using disposable local data. It sends no messages.
 
 `batch -` reads standard input. Each line is `put<TAB>key<TAB>value` or `delete<TAB>key`. LF and CRLF are accepted; blank lines, extra fields and empty files are rejected. At most 1,024 operations and 32 MiB of encoded batch payload are allowed. Per-key and per-value limits still apply. Operations run in listed order, including repeated keys. An empty library batch does nothing; it still rejects a poisoned handle.
 
-Old single-operation logs remain readable. Older DurableStore binaries reject batch records; keep the new binary with stores that use batches. Compaction writes the resulting live state as ordinary put records. This is atomic grouped writing, without rollback commands, conditional updates or concurrent transactions. A complete batch may survive a crash even if the caller did not receive acknowledgement.
+Old single-operation logs remain readable. Older DurableStore binaries reject batch records; keep the new binary with stores that use batches. Compaction writes the resulting live state as ordinary put records. This is atomic grouped writing, without rollback commands or concurrent transactions. A complete batch may survive a crash even if the caller did not receive acknowledgement.
 
 ## Persistence contract
 

@@ -3,7 +3,7 @@ use durablestore::{
     Store,
 };
 use std::{fmt::Write, io::Read, path::Path};
-const USAGE: &str = "durablestore <existing-directory> init | put <key-hex> <value-hex> | get <key-hex> | delete <key-hex> | batch <file|-> | list | scan <prefix-hex> <limit:1..1000> [after-key-hex] | inspect | health | compact";
+const USAGE: &str = "durablestore <existing-directory> init | put <key-hex> <value-hex> | get <key-hex> | delete <key-hex> | batch <file|-> [if <key-hex> <value-hex|absent>] | list | scan <prefix-hex> <limit:1..1000> [after-key-hex] | inspect | health | compact";
 // Bound hex data per scan response in addition to the row limit.
 const SCAN_HEX_BYTES: usize = 64 * 1024 * 1024;
 fn quote(s: &str) -> String {
@@ -155,7 +155,7 @@ fn run(args: &[String]) -> Result<(String, i32), String> {
     if args.len() < 2 {
         return Err(USAGE.into());
     }
-    if args[2..].iter().filter(|s| s.as_str() == "@-").count() > 1 {
+    if args[1] != "batch" && args[2..].iter().filter(|s| s.as_str() == "@-").count() > 1 {
         return Err("at most one hex argument may read stdin".into());
     }
     let scan = if args[1] == "scan" {
@@ -185,6 +185,7 @@ fn run(args: &[String]) -> Result<(String, i32), String> {
     let expected = match args[1].as_str() {
         "put" => 4,
         "scan" => args.len(),
+        "batch" if args.len() == 6 && args[3] == "if" => 6,
         "get" | "delete" | "batch" => 3,
         "init" | "list" | "inspect" | "health" | "compact" => 2,
         _ => return Err(USAGE.into()),
@@ -192,6 +193,21 @@ fn run(args: &[String]) -> Result<(String, i32), String> {
     if args.len() != expected {
         return Err(USAGE.into());
     }
+    let condition = if args[1] == "batch" && args.len() == 6 {
+        let stdin_readers = usize::from(args[2] == "-")
+            + args[4..].iter().filter(|arg| arg.as_str() == "@-").count();
+        if stdin_readers > 1 {
+            return Err("batch input and condition may use stdin only once".into());
+        }
+        let key = decode_argument(&args[4], MAX_KEY)?;
+        let expected = match args[5].as_str() {
+            "absent" => None,
+            value => Some(decode_argument(value, MAX_VALUE)?),
+        };
+        Some((key, expected))
+    } else {
+        None
+    };
     let batch = if args[1] == "batch" {
         Some(read_batch(&args[2])?)
     } else {
@@ -290,6 +306,12 @@ fn run(args: &[String]) -> Result<(String, i32), String> {
             Ok(("{\"ok\":true,\"durable\":true}".into(), 0))
         }
         "batch" => {
+            // This handle owns the writer lock through both comparison and append.
+            if let Some((key, expected)) = condition
+                && store.get(&key) != expected.as_deref()
+            {
+                return Ok((r#"{"ok":false,"reason":"condition_failed"}"#.into(), 3));
+            }
             let entries = batch.as_ref().unwrap();
             let operations: Vec<_> = entries
                 .iter()

@@ -547,3 +547,60 @@ fn invalid_hex_files_refuse_before_store_creation_or_mutation() {
     assert!(String::from_utf8(out.stderr).unwrap().contains("hex input"));
     assert_eq!(fs::read(d.0.join("data.wal")).unwrap(), wal);
 }
+
+#[test]
+fn guarded_batches_distinguish_absence_empty_values_and_stale_reads() {
+    let d = Dir::new();
+    assert!(run(&d, &["init"]).status.success());
+    let batch = d.0.join("edits.tsv");
+    fs::write(&batch, "put\t\t\nput\t61\t01\n").unwrap();
+    let path = batch.to_str().unwrap();
+    assert!(
+        run(&d, &["batch", path, "if", "", "absent"])
+            .status
+            .success()
+    );
+    let wal = d.0.join("data.wal");
+    let before = fs::read(&wal).unwrap();
+    let owner = durablestore::Store::open(&d.0).unwrap();
+    let locked = run(&d, &["batch", path, "if", "", ""]);
+    assert_eq!(locked.status.code(), Some(2));
+    assert!(String::from_utf8(locked.stderr).unwrap().contains("locked"));
+    drop(owner);
+    fs::write(&batch, "delete\t\nput\t61\t02\n").unwrap();
+    for (key, expected) in [("", "absent"), ("61", "00"), ("ff", "")] {
+        let out = run(&d, &["batch", path, "if", key, expected]);
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(
+            out.stdout,
+            b"{\"ok\":false,\"reason\":\"condition_failed\"}\n"
+        );
+        assert_eq!(fs::read(&wal).unwrap(), before);
+    }
+    assert!(run(&d, &["batch", path, "if", "", ""]).status.success());
+    assert!(run(&d, &["compact"]).status.success());
+    assert_eq!(run(&d, &["get", ""]).status.code(), Some(3));
+    assert_eq!(
+        run(&d, &["get", "61"]).stdout,
+        b"{\"found\":true,\"value_hex\":\"02\"}\n"
+    );
+}
+
+#[test]
+fn guarded_batch_rejects_ambiguous_stdin_before_opening_store() {
+    let d = Dir::new();
+    for args in [
+        ["batch", "-", "if", "@-", "absent"],
+        ["batch", "-", "if", "01", "@-"],
+        ["batch", "unused.tsv", "if", "@-", "@-"],
+    ] {
+        let out = run(&d, &args);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(
+            String::from_utf8(out.stderr)
+                .unwrap()
+                .contains("stdin only once")
+        );
+    }
+    assert!(!d.0.join("LOCK").exists());
+}
