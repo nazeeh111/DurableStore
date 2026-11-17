@@ -1,0 +1,13 @@
+{
+  "before": {
+    "job:42": "queued",
+    "pending:42": "artifact.txt"
+  },
+  "after": {
+    "job:42": "complete",
+    "result:42": "artifact.txt"
+  },
+  "operations_in_transition": 3,
+  "reopened_and_compacted": true,
+  "external_message_sent": false
+}

@@ -1,10 +1,43 @@
 # DurableStore
 
-**A Rust key-value store with synchronized writes and crash recovery.**
+**Byte storage, with an explicit recovery contract.**
 
-Store byte keys and values through a Rust library or JSON command line. A checksummed log, bounded recovery, exclusive writer lock and atomic compaction define the persistence contract.
+A small Rust key-value engine for understanding persistent state: synchronized
+writes, atomic batches, checksummed replay, an exclusive writer and atomic log
+compaction. Use the library or the JSON CLI; no server or third-party Rust
+dependencies are required.
 
-[Inspect the eight-boundary process-crash record](docs/crash-demo.json) or [run the crash demonstration](#crash-recovery-checks). This record tests process termination, not hardware power loss.
+[Run a complete example](#try-it) · [Atomic batches](#atomic-batches) · [Persistence contract](#persistence-contract) · [Inside the engine](#inside-the-engine)
+
+## Three changes, one durable transition
+
+A queued job becomes complete, its pending entry disappears, and its result is
+recorded in one batch. The included example opens a fresh CLI process for every
+operation, then compacts and reopens the store:
+
+| Before | After one three-operation batch |
+| --- | --- |
+| `job:42 = queued` | `job:42 = complete` |
+| `pending:42 = artifact.txt` | Removed |
+| No result | `result:42 = artifact.txt` |
+
+```json
+{
+  "operations_in_transition": 3,
+  "reopened_and_compacted": true,
+  "external_message_sent": false
+}
+```
+
+This excerpt comes from the [recorded local run](docs/presentation/atomic-batch-session.json).
+[Reproduce it](docs/presentation/README.md) with the existing
+[`batch_demo.py`](scripts/batch_demo.py). It is a local state transition, not an
+external message delivery guarantee.
+
+Recovery admits a complete batch or none of it. An unacknowledged batch may
+already have persisted. The [eight-boundary process-crash record](docs/crash-demo.json)
+and [crash demonstration](#crash-recovery-checks) explore that distinction;
+process termination does not establish hardware power-loss safety.
 
 ## Try it
 
