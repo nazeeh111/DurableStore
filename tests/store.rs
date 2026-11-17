@@ -541,3 +541,63 @@ fn cwd_change_child() {
     assert_eq!(s.get(b"a"), Some(b"original".as_slice()));
     assert_eq!(s.get(b"b"), Some(b"after".as_slice()));
 }
+
+#[test]
+fn prefix_scan_matches_filter_oracle_across_reopen_and_compaction() {
+    let d = Dir::new();
+    let mut s = Store::open(&d.0).unwrap();
+    let mut oracle = std::collections::BTreeMap::new();
+    for key in [vec![], vec![0], vec![255], vec![255, 255]]
+        .into_iter()
+        .chain((0u16..512).map(|n| vec![(n / 256) as u8, n as u8]))
+    {
+        let value = key.iter().rev().copied().collect::<Vec<_>>();
+        s.put(&key, &value).unwrap();
+        oracle.insert(key, value);
+    }
+    s.delete(&[0, 7]).unwrap();
+    oracle.remove(&vec![0, 7]);
+    let prefixes = [
+        vec![],
+        vec![0],
+        vec![1],
+        vec![2],
+        vec![255],
+        vec![255, 255],
+        vec![0, 7],
+    ];
+    let cursors = [
+        None,
+        Some(vec![]),
+        Some(vec![0]),
+        Some(vec![0, 7]),
+        Some(vec![1, 255]),
+        Some(vec![255, 255, 255]),
+    ];
+    for stage in 0..3 {
+        for prefix in &prefixes {
+            for cursor in &cursors {
+                let expected = oracle
+                    .iter()
+                    .filter(|(key, _)| {
+                        key.starts_with(prefix) && cursor.as_ref().is_none_or(|c| *key > c)
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>();
+                let actual = s
+                    .scan_prefix(prefix, cursor.as_deref())
+                    .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual, expected,
+                    "stage {stage} prefix {prefix:?} cursor {cursor:?}"
+                );
+            }
+        }
+        if stage == 0 {
+            s.compact().unwrap();
+        }
+        drop(s);
+        s = Store::open(&d.0).unwrap();
+    }
+}
