@@ -176,6 +176,25 @@ impl Store {
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
     }
+    /// Borrow live entries in byte order whose keys start with `prefix`.
+    /// `after` is an exclusive key cursor; it need not exist in the store.
+    /// An empty prefix matches every key. The range seeks directly to its start.
+    /// Separate calls observe current state, not a snapshot across writes.
+    pub fn scan_prefix<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        after: Option<&[u8]>,
+    ) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + 'a {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let start = match after {
+            Some(cursor) if cursor >= prefix => Excluded(cursor),
+            _ => Included(prefix),
+        };
+        self.entries
+            .range::<[u8], _>((start, Unbounded))
+            .take_while(move |(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.as_slice(), value.as_slice()))
+    }
     pub fn stats(&self) -> Stats {
         Stats {
             live_keys: self.entries.len(),

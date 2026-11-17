@@ -321,3 +321,229 @@ fn help_and_version_identify_current_source() {
         format!("{{\"version\":\"{}\"}}", env!("CARGO_PKG_VERSION"))
     );
 }
+
+#[test]
+fn scan_pages_have_exclusive_cursors_and_exact_terminal_detection() {
+    let d = Dir::new();
+    assert!(run(&d, &["init"]).status.success());
+    for key in ["", "00", "0000", "00ff", "01", "ff", "ffff"] {
+        assert!(run(&d, &["put", key, "ab"]).status.success());
+    }
+    for (args, expected) in [
+        (
+            vec!["scan", "00", "2"],
+            r#"{"entries":[{"key_hex":"00","value_hex":"ab"},{"key_hex":"0000","value_hex":"ab"}],"next_after_hex":"0000"}"#,
+        ),
+        (
+            vec!["scan", "00", "1", "0000"],
+            r#"{"entries":[{"key_hex":"00ff","value_hex":"ab"}],"next_after_hex":null}"#,
+        ),
+        (
+            vec!["scan", "00", "1", "0001"],
+            r#"{"entries":[{"key_hex":"00ff","value_hex":"ab"}],"next_after_hex":null}"#,
+        ),
+        (
+            vec!["scan", "", "1"],
+            r#"{"entries":[{"key_hex":"","value_hex":"ab"}],"next_after_hex":""}"#,
+        ),
+        (
+            vec!["scan", "", "1", ""],
+            r#"{"entries":[{"key_hex":"00","value_hex":"ab"}],"next_after_hex":"00"}"#,
+        ),
+        (
+            vec!["scan", "ff", "2"],
+            r#"{"entries":[{"key_hex":"ff","value_hex":"ab"},{"key_hex":"ffff","value_hex":"ab"}],"next_after_hex":null}"#,
+        ),
+        (
+            vec!["scan", "ff", "1", "ffffff"],
+            r#"{"entries":[],"next_after_hex":null}"#,
+        ),
+        (
+            vec!["scan", "02", "1000"],
+            r#"{"entries":[],"next_after_hex":null}"#,
+        ),
+    ] {
+        let out = run(&d, &args);
+        assert!(out.status.success(), "{args:?}: {:?}", out.stderr);
+        assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), expected);
+    }
+    assert!(run(&d, &["delete", "0000"]).status.success());
+    assert!(run(&d, &["compact"]).status.success());
+    let out = run(&d, &["scan", "00", "1", "0000"]);
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        r#"{"entries":[{"key_hex":"00ff","value_hex":"ab"}],"next_after_hex":null}"#
+    );
+}
+
+#[test]
+fn invalid_scan_arguments_do_not_create_store_files() {
+    let d = Dir::new();
+    for args in [
+        vec!["scan"],
+        vec!["scan", "00", "0"],
+        vec!["scan", "00", "1001"],
+        vec!["scan", "00", "-1"],
+        vec!["scan", "00", "+1"],
+        vec!["scan", "00", "1.0"],
+        vec!["scan", "00", "9999999999999999999999999"],
+        vec!["scan", "00", ""],
+        vec!["scan", "z0", "1"],
+        vec!["scan", "0", "1"],
+        vec!["scan", "00", "1", "ff"],
+        vec!["scan", "00", "1", "z0"],
+        vec!["scan", "00", "1", "00", "extra"],
+    ] {
+        let out = run(&d, &args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty());
+        assert!(!d.0.join("LOCK").exists());
+        assert!(!d.0.join("data.wal").exists());
+    }
+    let out = run(&d, &["scan", "", "1"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!d.0.join("LOCK").exists());
+}
+
+#[test]
+fn maximum_keys_roundtrip_and_resume_from_the_returned_cursor_file() {
+    let d = Dir::new();
+    let inputs = Dir::new();
+    let prefix = "00".repeat(durablestore::MAX_KEY - 1);
+    let first = format!("{prefix}01");
+    let second = format!("{prefix}02");
+    let prefix_file = inputs.0.join("prefix.hex");
+    let first_file = inputs.0.join("first.hex");
+    let second_file = inputs.0.join("second.hex");
+    let cursor_file = inputs.0.join("cursor.hex");
+    fs::write(&prefix_file, format!("{prefix}\n")).unwrap();
+    fs::write(&first_file, format!("{first}\r\n")).unwrap();
+    fs::write(&second_file, &second).unwrap();
+    let prefix_arg = format!("@{}", prefix_file.display());
+    let first_arg = format!("@{}", first_file.display());
+    let second_arg = format!("@{}", second_file.display());
+    let cursor_arg = format!("@{}", cursor_file.display());
+    assert!(run(&d, &["init"]).status.success());
+    for (key, value) in [(&first_arg, "a1"), (&second_arg, "b2")] {
+        assert!(run(&d, &["put", key, value]).status.success());
+    }
+    let page = run(&d, &["scan", &prefix_arg, "1"]);
+    assert!(page.status.success());
+    let page = String::from_utf8(page.stdout).unwrap();
+    let cursor = page
+        .split("\"next_after_hex\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    assert!(
+        cursor == first,
+        "the response must expose the actual first key"
+    );
+    fs::write(&cursor_file, format!("{cursor}\n")).unwrap();
+    assert!(run(&d, &["compact"]).status.success());
+    let next = run(&d, &["scan", &prefix_arg, "1", &cursor_arg]);
+    assert!(next.status.success());
+    assert!(
+        next.stdout == format!("{{\"entries\":[{{\"key_hex\":\"{second}\",\"value_hex\":\"b2\"}}],\"next_after_hex\":null}}\n").as_bytes(),
+        "a fresh process must continue to the second maximum-size key"
+    );
+    let get = run(&d, &["get", &second_arg]);
+    assert!(get.status.success());
+    assert_eq!(get.stdout, b"{\"found\":true,\"value_hex\":\"b2\"}\n");
+    assert!(run(&d, &["delete", &second_arg]).status.success());
+    assert_eq!(run(&d, &["get", &second_arg]).status.code(), Some(3));
+}
+
+#[test]
+fn hex_stdin_and_empty_files_preserve_binary_and_empty_key_semantics() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let d = Dir::new();
+    let inputs = Dir::new();
+    let empty = inputs.0.join("empty.hex");
+    fs::write(&empty, b"").unwrap();
+    let empty_arg = format!("@{}", empty.display());
+    assert!(run(&d, &["init"]).status.success());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_durablestore"))
+        .arg(&d.0)
+        .args(["put", &empty_arg, "@-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"Ff00\r\n").unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    assert_eq!(
+        run(&d, &["get", &empty_arg]).stdout,
+        b"{\"found\":true,\"value_hex\":\"ff00\"}\n"
+    );
+    assert!(run(&d, &["put", "00", "11"]).status.success());
+    assert_eq!(
+        run(&d, &["scan", "", "1"]).stdout,
+        b"{\"entries\":[{\"key_hex\":\"\",\"value_hex\":\"ff00\"}],\"next_after_hex\":\"\"}\n"
+    );
+    assert_eq!(
+        run(&d, &["scan", "", "1", &empty_arg]).stdout,
+        b"{\"entries\":[{\"key_hex\":\"00\",\"value_hex\":\"11\"}],\"next_after_hex\":null}\n"
+    );
+}
+
+#[test]
+fn invalid_hex_files_refuse_before_store_creation_or_mutation() {
+    let d = Dir::new();
+    let inputs = Dir::new();
+    for (name, bytes) in [
+        ("non-utf8", vec![0xff]),
+        ("odd", b"f".to_vec()),
+        ("embedded-line", b"00\n00\n".to_vec()),
+        ("carriage-only", b"00\r".to_vec()),
+        ("too-much-text", vec![b'0'; 2 * durablestore::MAX_KEY + 3]),
+        (
+            "decoded-too-long",
+            vec![b'0'; 2 * durablestore::MAX_KEY + 2],
+        ),
+    ] {
+        let path = inputs.0.join(name);
+        fs::write(&path, bytes).unwrap();
+        let arg = format!("@{}", path.display());
+        for args in [
+            vec!["get", &arg],
+            vec!["delete", &arg],
+            vec!["put", &arg, "00"],
+            vec!["scan", &arg, "1"],
+            vec!["scan", "", "1", &arg],
+        ] {
+            let out = run(&d, &args);
+            assert_eq!(out.status.code(), Some(2));
+            assert!(out.stdout.is_empty());
+            assert!(String::from_utf8(out.stderr).unwrap().contains("hex"));
+            assert!(!d.0.join("LOCK").exists());
+            assert!(!d.0.join("data.wal").exists());
+        }
+    }
+    let missing = format!("@{}", inputs.0.join("missing").display());
+    let out = run(&d, &["get", &missing]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8(out.stderr).unwrap().contains("hex file"));
+    assert!(!d.0.join("LOCK").exists());
+    let out = run(&d, &["put", "@-", "@-"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("at most one")
+    );
+    assert!(!d.0.join("data.wal").exists());
+
+    assert!(run(&d, &["init"]).status.success());
+    assert!(run(&d, &["put", "aa", "bb"]).status.success());
+    let wal = fs::read(d.0.join("data.wal")).unwrap();
+    let bad_value = format!("@{}", inputs.0.join("non-utf8").display());
+    let out = run(&d, &["put", "aa", &bad_value]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8(out.stderr).unwrap().contains("hex input"));
+    assert_eq!(fs::read(d.0.join("data.wal")).unwrap(), wal);
+}
