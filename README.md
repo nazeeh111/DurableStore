@@ -67,6 +67,15 @@ is historical and does not contain the new `health` operation.
 
 Keys and values use hexadecimal in the CLI, allowing arbitrary bytes. `""` represents empty bytes. `list` returns keys in byte-sorted order. `delete <key-hex>` appends a tombstone, including for absent keys. `get` exits with code **3** for a missing key; operational/input errors exit **2** with a JSON error on stderr. Successful commands emit JSON on stdout and exit **0**. Only `init` creates a database; the directory must already exist. The library supports values larger than common shell argument limits.
 
+Every hexadecimal argument also accepts `@FILE` to read hex from a file, or `@-`
+to read standard input. This includes keys, values, scan prefixes and cursors, so
+legal large inputs do not need to fit the operating system's argument limit.
+Files contain hex digits, optionally followed by one LF or CRLF; an empty file
+represents empty bytes. Reads are bounded by twice the decoded key/value limit
+plus the final line ending, and input errors are rejected before opening the
+store. At most one argument per command may read stdin. Batch files keep their
+existing tab-separated format; `@FILE` applies to CLI hex arguments only.
+
 ```rust
 use durablestore::Store;
 
@@ -79,6 +88,46 @@ fn save_result(directory: &std::path::Path) -> durablestore::Result<()> {
     Ok(())
 }
 ```
+
+## Prefix scans and pages
+
+Use `scan` to read one key namespace without serializing the entire live index:
+
+```sh
+./target/release/durablestore demo-store scan 70656e64696e673a 100
+# prefix is pending:; response has entries and next_after_hex
+./target/release/durablestore demo-store scan 70656e64696e673a 100 <next_after_hex>
+```
+
+Entries are byte-sorted. Pass the returned `next_after_hex` as the exclusive cursor
+until it is `null`. An empty string is a valid cursor for the empty key; it does
+not mean completion. An empty prefix (`""`) scans all keys. Limits are integers
+from 1 to 1,000. A page also stops before exceeding 64 MiB of key/value hexadecimal
+data, with small JSON framing overhead. Each legal single entry fits. The cursor
+must start with the requested prefix and need not still exist in the store.
+Invalid arguments are rejected before opening the store.
+
+For a large continuation cursor, save the non-null `next_after_hex` string as
+`cursor.hex` (without JSON quotes), then use:
+
+```sh
+./target/release/durablestore demo-store scan "" 100 @cursor.hex
+```
+
+Use the same prefix for every page; a large prefix can likewise use `@prefix.hex`.
+An empty cursor file resumes after the empty key, while `null` means stop.
+
+The library provides `store.scan_prefix(prefix, after)` as a borrowing iterator
+that seeks into the existing ordered index without collecting all matches.
+`after: None` starts at the prefix; `Some(key)` excludes that key and all earlier
+keys. Callers can use `.take(limit)` for their own page size. An empty prefix
+matches all keys, including empty and arbitrary binary keys.
+
+Each CLI page opens the store again. Writes between pages can change the results:
+a new key at or before the cursor will not appear, and deleted keys disappear.
+This is not a snapshot transaction. Startup still replays the whole log into RAM,
+and normal open can repair an incomplete tail, just like `get` and `list`.
+The existing lock, storage format and durability contract apply.
 
 ## Atomic batches
 

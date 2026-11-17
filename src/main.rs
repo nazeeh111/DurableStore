@@ -3,7 +3,9 @@ use durablestore::{
     Store,
 };
 use std::{fmt::Write, io::Read, path::Path};
-const USAGE: &str = "durablestore <existing-directory> init | put <key-hex> <value-hex> | get <key-hex> | delete <key-hex> | batch <file|-> | list | inspect | health | compact";
+const USAGE: &str = "durablestore <existing-directory> init | put <key-hex> <value-hex> | get <key-hex> | delete <key-hex> | batch <file|-> | list | scan <prefix-hex> <limit:1..1000> [after-key-hex] | inspect | health | compact";
+// Bound hex data per scan response in addition to the row limit.
+const SCAN_HEX_BYTES: usize = 64 * 1024 * 1024;
 fn quote(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
@@ -48,6 +50,33 @@ fn decode(s: &str, max: usize) -> Result<Vec<u8>, String> {
                 + digit(p[1]).ok_or("invalid hex digit")?)
         })
         .collect()
+}
+fn decode_argument(s: &str, max: usize) -> Result<Vec<u8>, String> {
+    let Some(path) = s.strip_prefix('@') else {
+        return decode(s, max);
+    };
+    let input: Box<dyn Read> = if path == "-" {
+        Box::new(std::io::stdin())
+    } else {
+        Box::new(std::fs::File::open(path).map_err(|e| format!("hex file: {e}"))?)
+    };
+    // Hex doubles the decoded limit; permit one final LF or CRLF, plus a
+    // sentinel byte to detect oversized input without reading an entire file.
+    let limit = 2 * max + 2;
+    let mut bytes = Vec::new();
+    input
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("hex input: {e}"))?;
+    if bytes.len() > limit {
+        return Err("hex input exceeds text size limit".into());
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| "hex input must be UTF-8")?;
+    let text = text
+        .strip_suffix('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .unwrap_or(text);
+    decode(text, max)
 }
 type BatchEntry = (Vec<u8>, Option<Vec<u8>>);
 
@@ -111,7 +140,7 @@ fn run(args: &[String]) -> Result<(String, i32), String> {
     if args == ["--help"] || args == ["-h"] {
         return Ok((
             format!(
-                "{{\"usage\":{},\"bytes\":\"Keys and values are hex; use empty strings for empty bytes.\",\"health\":\"Read-only log scan: exit 0 good, 3 incomplete or corrupt, 2 error.\",\"inspect\":\"Read-only live-state scan; ordinary opens can repair an incomplete tail.\"}}",
+                "{{\"usage\":{},\"bytes\":\"Keys and values are hex; use empty strings for empty bytes. Hex arguments also accept @FILE or @- for bounded file or stdin input, with at most one stdin argument.\",\"health\":\"Read-only log scan: exit 0 good, 3 incomplete or corrupt, 2 error.\",\"inspect\":\"Read-only live-state scan; ordinary opens can repair an incomplete tail.\"}}",
                 quote(USAGE)
             ),
             0,
@@ -126,8 +155,36 @@ fn run(args: &[String]) -> Result<(String, i32), String> {
     if args.len() < 2 {
         return Err(USAGE.into());
     }
+    if args[2..].iter().filter(|s| s.as_str() == "@-").count() > 1 {
+        return Err("at most one hex argument may read stdin".into());
+    }
+    let scan = if args[1] == "scan" {
+        if !(4..=5).contains(&args.len()) {
+            return Err(USAGE.into());
+        }
+        if args[3].is_empty() || !args[3].bytes().all(|b| b.is_ascii_digit()) {
+            return Err("scan limit must be an integer from 1 to 1000".into());
+        }
+        let limit: usize = args[3]
+            .parse()
+            .ok()
+            .filter(|n| (1..=1000).contains(n))
+            .ok_or("scan limit must be an integer from 1 to 1000")?;
+        let prefix = decode_argument(&args[2], MAX_KEY)?;
+        let after = args
+            .get(4)
+            .map(|s| decode_argument(s, MAX_KEY))
+            .transpose()?;
+        if after.as_ref().is_some_and(|key| !key.starts_with(&prefix)) {
+            return Err("scan cursor must start with the requested prefix".into());
+        }
+        Some((prefix, limit, after))
+    } else {
+        None
+    };
     let expected = match args[1].as_str() {
         "put" => 4,
+        "scan" => args.len(),
         "get" | "delete" | "batch" => 3,
         "init" | "list" | "inspect" | "health" | "compact" => 2,
         _ => return Err(USAGE.into()),
@@ -140,13 +197,13 @@ fn run(args: &[String]) -> Result<(String, i32), String> {
     } else {
         None
     };
-    let key = if expected >= 3 && args[1] != "batch" {
-        decode(&args[2], MAX_KEY)?
+    let key = if matches!(args[1].as_str(), "put" | "get" | "delete") {
+        decode_argument(&args[2], MAX_KEY)?
     } else {
         vec![]
     };
-    let value = if expected == 4 {
-        decode(&args[3], MAX_VALUE)?
+    let value = if args[1] == "put" {
+        decode_argument(&args[3], MAX_VALUE)?
     } else {
         vec![]
     };
@@ -186,6 +243,43 @@ fn run(args: &[String]) -> Result<(String, i32), String> {
     }
     let mut store = Store::open(dir).map_err(|e| e.to_string())?;
     match args[1].as_str() {
+        "scan" => {
+            let (prefix, limit, after) = scan.as_ref().unwrap();
+            let mut entries = String::new();
+            let mut hex_bytes = 0;
+            let mut last_key = None;
+            let mut more = false;
+            for (count, (key, value)) in store.scan_prefix(prefix, after.as_deref()).enumerate() {
+                let size = 2 * (key.len() + value.len());
+                if count == *limit || hex_bytes + size > SCAN_HEX_BYTES {
+                    more = true;
+                    break;
+                }
+                if count > 0 {
+                    entries.push(',');
+                }
+                write!(
+                    entries,
+                    "{{\"key_hex\":\"{}\",\"value_hex\":\"{}\"}}",
+                    hex(key),
+                    hex(value)
+                )
+                .unwrap();
+                hex_bytes += size;
+                last_key = Some(key);
+            }
+            // Every legal single entry fits the byte budget, so a nonterminal
+            // page always advances, including when its last key is empty.
+            let next = if more {
+                quote(&hex(last_key.unwrap()))
+            } else {
+                "null".into()
+            };
+            Ok((
+                format!("{{\"entries\":[{entries}],\"next_after_hex\":{next}}}"),
+                0,
+            ))
+        }
         "init" => Ok((stats(&store.stats()), 0)),
         "put" => {
             store.put(&key, &value).map_err(|e| e.to_string())?;
